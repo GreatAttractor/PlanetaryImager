@@ -81,12 +81,22 @@ class IIDCImagerWorker: public ImagerThread::Worker
 
     struct
     {
-        bool initialized; // If 'false', the remaining fields have not been set yet
+        bool initialized; ///< If 'false', the remaining fields have not been set yet
 
         Frame::ColorFormat colorFormat;
         uint8_t bitsPerChannel;
         Frame::ByteOrder byteOrder;
+        bool needsYUVtoRGBconversion;
+        size_t srcBytesPerLine; ///< Set only for YUV formats
     } frameInfo;
+
+    /// Used for YUV->RGB conversion
+    /** Required, because conversion function expects buffers without line padding,
+        which may be present in a dequeued capture buffer. */
+    struct
+    {
+        std::unique_ptr<uint8_t[]> src, dest;
+    } conversionBuf;
 
     /// If 'vidMode' supports a fixed set of framerates, sets the highest supported framerate
     void setHighestFramerate(dc1394video_mode_t vidMode);
@@ -249,6 +259,22 @@ void IIDCImagerWorker::initFrameInfo()
 
     frameInfo.bitsPerChannel = nativeFrame->data_depth;
     frameInfo.byteOrder = (nativeFrame->little_endian ? Frame::ByteOrder::LittleEndian : Frame::ByteOrder::BigEndian);
+
+    switch (nativeFrame->color_coding)
+    {
+    case DC1394_COLOR_CODING_YUV411: frameInfo.srcBytesPerLine = (3 * nativeFrame->size[0] + 1) / 2; break;
+    case DC1394_COLOR_CODING_YUV422: frameInfo.srcBytesPerLine = 2 * nativeFrame->size[0]; break;
+    case DC1394_COLOR_CODING_YUV444: frameInfo.srcBytesPerLine = 3 * nativeFrame->size[0]; break;
+
+    default: frameInfo.srcBytesPerLine = 0; break;
+    }
+}
+
+static bool isYUV(dc1394color_coding_t colorCoding)
+{
+    return colorCoding == DC1394_COLOR_CODING_YUV411 ||
+           colorCoding == DC1394_COLOR_CODING_YUV422 ||
+           colorCoding == DC1394_COLOR_CODING_YUV444;
 }
 
 Frame::ptr IIDCImagerWorker::shoot()
@@ -261,22 +287,70 @@ Frame::ptr IIDCImagerWorker::shoot()
     {
         initFrameInfo();
         frameInfo.initialized = true;
+
+        if (isYUV(nativeFrame->color_coding))
+        {
+            frameInfo.needsYUVtoRGBconversion = true;
+            conversionBuf.src = std::make_unique<uint8_t[]>(nativeFrame->total_bytes); // Pass 'total_bytes' for simplicity; we may use less
+            conversionBuf.dest = std::make_unique<uint8_t[]>(nativeFrame->size[0] * nativeFrame->size[1] * 3); // 3 bytes/pixel (R, G, B)
+        }
+        else
+            frameInfo.needsYUVtoRGBconversion = false;
     }
+
+    const size_t imgWidth = nativeFrame->size[0],
+                 imgHeight = nativeFrame->size[1];
 
     auto frame = std::make_shared<Frame>(frameInfo.bitsPerChannel,
                                          frameInfo.colorFormat,
-                                         QSize{ (int)nativeFrame->size[0], (int)nativeFrame->size[1] },
+                                         QSize{ (int)imgWidth, (int)imgHeight },
                                          frameInfo.byteOrder);
 
-    //TODO: convert from YUV to RGB
+    uint8_t *srcLine;
+    size_t srcLineStep;
 
     uint8_t *destLine = frame->mat().data;
     const size_t destLineStep = frame->mat().step[0];
-    const size_t numCopyBytes = std::min(destLineStep, (size_t)nativeFrame->stride);
+    size_t numDestCopyBytes; // Number of bytes per line to copy into 'frame'
+
+    if (frameInfo.needsYUVtoRGBconversion)
+    {
+        //
+        // 1) Condense source data from 'nativeFrame' into 'conversionBuf.src'
+        //
+
+        for (size_t y = 0; y < imgHeight; y++)
+            memcpy(conversionBuf.src.get() + y*frameInfo.srcBytesPerLine,
+                   nativeFrame->image + y * nativeFrame->stride,
+                   frameInfo.srcBytesPerLine);
+
+        //
+        // 2) Convert
+        //
+
+        dc1394_convert_to_RGB8(conversionBuf.src.get(), conversionBuf.dest.get(), imgWidth, imgHeight,
+                               nativeFrame->yuv_byte_order, nativeFrame->color_coding, 8);
+
+        //
+        // 3) Prepare to copy converted data to 'frame'
+        //
+
+        srcLine = conversionBuf.dest.get();
+        srcLineStep = imgWidth * 3;
+        numDestCopyBytes = std::min(destLineStep, imgWidth * 3);
+    }
+    else
+    {
+        srcLine = nativeFrame->image;
+        srcLineStep = nativeFrame->stride;
+        numDestCopyBytes = std::min(destLineStep, (size_t)nativeFrame->stride);
+    }
 
     for (int y = 0; y < frame->mat().rows; y++)
     {
-        memcpy(destLine, nativeFrame->image + y * nativeFrame->stride, numCopyBytes);
+        memcpy(destLine, srcLine, numDestCopyBytes);
+
+        srcLine += srcLineStep;
         destLine += destLineStep;
     }
 
