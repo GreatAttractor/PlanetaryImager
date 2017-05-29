@@ -189,7 +189,7 @@ Imager::Controls IIDCImager::controls() const
             //
             // Some cameras may report only Format7 modes.
 
-            modeName += " (FMT7: %10)"_q % (vidMode - DC1394_VIDEO_MODE_FORMAT7_0);
+            modeName += " (FMT7: %1)"_q % (vidMode - DC1394_VIDEO_MODE_FORMAT7_0);
         }
 
         videoMode.add_choice_enum(modeName, vidMode);
