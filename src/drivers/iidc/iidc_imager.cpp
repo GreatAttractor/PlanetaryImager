@@ -56,12 +56,15 @@ DPTR_IMPL(IIDCImager)
     std::unique_ptr<dc1394camera_t, Deleters::camera> camera;
 
     dc1394video_modes_t videoModes;
-
     dc1394video_mode_t currentVidMode;
+
+    dc1394featureset_t features;
 
     Properties properties;
 
     void updateWorkerExposureTimeout();
+
+    Control enumerateVideoModes();
 
     LOG_C_SCOPE(IIDCImager);
   //ROIValidator::ptr roi_validator;
@@ -70,6 +73,45 @@ DPTR_IMPL(IIDCImager)
 void IIDCImager::Private::updateWorkerExposureTimeout()
 {
 //TODO: implement this
+}
+
+Imager::Control IIDCImager::Private::enumerateVideoModes()
+{
+    auto videoMode = Imager::Control{ ControlID::VideoMode, "Video Mode", Control::Combo };
+
+    for (uint32_t i = 0; i < videoModes.num; i++)
+    {
+        const dc1394video_mode_t vidMode = videoModes.modes[i];
+
+        uint32_t width, height;
+        IIDC_CHECK << dc1394_get_image_size_from_video_mode(camera.get(), vidMode, &width, &height)
+                   << "Get image size from video mode";
+
+        dc1394color_coding_t coding;
+        IIDC_CHECK << dc1394_get_color_coding_from_video_mode(camera.get(), vidMode, &coding)
+                   << "Get color coding from video mode";
+
+        // FIXME: does not compile if COLOR_CODING_NAME is 'const'; possibly a problem with _q or %
+        QString modeName = "%1x%2 %3"_q % width % height % COLOR_CODING_NAME[coding];
+
+        if (vidMode >= DC1394_VIDEO_MODE_FORMAT7_MIN &&
+            vidMode <= DC1394_VIDEO_MODE_FORMAT7_MAX)
+        {
+            // Format7 modes may have additional capabilities:
+            //   - max framerate different than the predefined ones in 'dc1394framerate_t' enum
+            //   - ROI support
+            //   - various modes of pixel binning
+            //
+            // Some cameras may report only Format7 modes.
+
+            modeName += " (FMT7: %1)"_q % (vidMode - DC1394_VIDEO_MODE_FORMAT7_0);
+        }
+
+        videoMode.add_choice_enum(modeName, vidMode);
+    }
+    videoMode.set_value_enum(currentVidMode);
+
+    return videoMode;
 }
 
 class IIDCImagerWorker: public ImagerThread::Worker
@@ -128,6 +170,9 @@ IIDCImager::IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera,
 
     d->currentVidMode = d->videoModes.modes[0];
 
+    IIDC_CHECK << dc1394_feature_get_all(d->camera.get(), &d->features)
+               << "Get all features";
+
     connect(this, &Imager::exposure_changed, this, std::bind(&Private::updateWorkerExposureTimeout, d.get()));
 }
 
@@ -169,41 +214,82 @@ Imager::Controls IIDCImager::controls() const
 {
     Controls controls;
 
-    auto videoMode = Control{ ControlID::VideoMode, "Video Mode", Control::Combo };
+    controls.push_back(std::move(d->enumerateVideoModes()));
 
-    for (uint32_t i = 0; i < d->videoModes.num; i++)
-    {
-        const dc1394video_mode_t vidMode = d->videoModes.modes[i];
-
-        uint32_t width, height;
-        IIDC_CHECK << dc1394_get_image_size_from_video_mode(d->camera.get(), vidMode, &width, &height)
-                   << "Get image size from video mode";
-
-        dc1394color_coding_t coding;
-        IIDC_CHECK << dc1394_get_color_coding_from_video_mode(d->camera.get(), vidMode, &coding)
-                   << "Get color coding from video mode";
-
-        // FIXME: does not compile if COLOR_CODING_NAME is 'const'; possibly a problem with _q or %
-        QString modeName = "%1x%2 %3"_q % width % height % COLOR_CODING_NAME[coding];
-
-        if (vidMode >= DC1394_VIDEO_MODE_FORMAT7_MIN &&
-            vidMode <= DC1394_VIDEO_MODE_FORMAT7_MAX)
+    for (const dc1394feature_info_t &feature: d->features.feature)
+        if (DC1394_TRUE == feature.available)
         {
-            // Format7 modes may have additional capabilities:
-            //   - max framerate different than the predefined ones in 'dc1394framerate_t' enum
-            //   - ROI support
-            //   - various modes of pixel binning
-            //
-            // Some cameras may report only Format7 modes.
+            Control control{ feature.id };
+            control.type = Control::Type::Number;
 
-            modeName += " (FMT7: %1)"_q % (vidMode - DC1394_VIDEO_MODE_FORMAT7_0);
+            switch (feature.id)
+            {
+                case DC1394_FEATURE_BRIGHTNESS:      control.name = "Brightness"; break;
+
+                // This is not "exposure time" (see DC1394_FEATURE_SHUTTER for that);
+                // instead, it regulates the values of shutter and gain - if they are set to auto
+                case DC1394_FEATURE_EXPOSURE:        control.name = "Exposure"; break;
+
+                case DC1394_FEATURE_SHARPNESS:       control.name = "Sharpness"; break;
+
+                //TODO: this is in fact a pair of controls
+                //case DC1394_FEATURE_WHITE_BALANCE:   control.name = "White balance"; break;
+
+                case DC1394_FEATURE_HUE:             control.name = "Hue"; break;
+                case DC1394_FEATURE_SATURATION:      control.name = "Saturation"; break;
+                case DC1394_FEATURE_GAMMA:           control.name = "Gamma"; break;
+
+                case DC1394_FEATURE_SHUTTER:
+                    control.name = "Shutter";
+                    control.is_exposure = true;
+                    control.is_duration = true;
+                    break;
+
+                case DC1394_FEATURE_GAIN:            control.name = "Gain"; break;
+                case DC1394_FEATURE_IRIS:            control.name = "Iris"; break;
+                case DC1394_FEATURE_FOCUS:           control.name = "Focus"; break;
+                case DC1394_FEATURE_TEMPERATURE:     control.name = "Temperature"; break;
+                case DC1394_FEATURE_TRIGGER:         control.name = "Trigger"; break;
+
+                case DC1394_FEATURE_TRIGGER_DELAY:
+                    control.name = "Trigger delay";
+                    control.is_duration = true;
+                    break;
+
+                //TODO: this is in fact a triple of controls
+                //case DC1394_FEATURE_WHITE_SHADING:   control.name = "White shading"; break;
+
+                case DC1394_FEATURE_FRAME_RATE:      control.name = "Frame rate"; break;
+                case DC1394_FEATURE_ZOOM:            control.name = "Zoom"; break;
+                case DC1394_FEATURE_PAN:             control.name = "Pan"; break;
+                case DC1394_FEATURE_TILT:            control.name = "Tilt"; break;
+                case DC1394_FEATURE_OPTICAL_FILTER:  control.name = "Optical filter"; break;
+                case DC1394_FEATURE_CAPTURE_SIZE:    control.name = "Capture size"; break;
+                case DC1394_FEATURE_CAPTURE_QUALITY: control.name = "Capture quality"; break;
+
+                default: continue;
+            }
+
+            dc1394switch_t currOnOff;
+            IIDC_CHECK << dc1394_feature_get_power(d->camera.get(), feature.id, &currOnOff)
+                       << "Get feature on/off";
+            if (DC1394_OFF == currOnOff)
+                continue; // TODO: handle controls that are on/off-switchable
+
+            control.supports_auto = (std::find(feature.modes.modes, feature.modes.modes + feature.modes.num, DC1394_FEATURE_MODE_AUTO)
+                                       != feature.modes.modes + feature.modes.num);
+
+            control.readonly = (0 == feature.modes.num &&
+                                DC1394_TRUE == feature.readout_capable);
+
+            dc1394feature_mode_t currMode;
+            IIDC_CHECK << dc1394_feature_get_mode(d->camera.get(), feature.id, &currMode)
+                        << "Get feature mode";
+            control.value_auto = (DC1394_FEATURE_MODE_AUTO == currMode);
+
+            controls.push_back(std::move(control));
         }
 
-        videoMode.add_choice_enum(modeName, vidMode);
-    }
-    videoMode.set_value_enum(d->currentVidMode);
-
-    controls.push_back(std::move(videoMode));
 
     return controls;
 }
