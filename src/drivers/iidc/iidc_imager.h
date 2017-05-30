@@ -52,7 +52,7 @@ public slots:
 
     void clearROI() override;
 
-    void setControl(const Control& setting) override;
+    void setControl(const Control& control) override;
 
     void readTemperature() override;
 

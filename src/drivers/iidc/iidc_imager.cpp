@@ -61,8 +61,6 @@ DPTR_IMPL(IIDCImager)
 
     Properties properties;
 
-    std::shared_ptr<IIDCImagerWorker> worker;
-
     void updateWorkerExposureTimeout();
 
     LOG_C_SCOPE(IIDCImager);
@@ -150,8 +148,17 @@ QString IIDCImager::name() const
     return "IIDC Imager";
 }
 
-void IIDCImager::setControl(const Imager::Control& setting)
+void IIDCImager::setControl(const Imager::Control& control)
 {
+    LOG_F_SCOPE
+
+    if (control.id == ControlID::VideoMode)
+    {
+        d->currentVidMode = control.get_value_enum<dc1394video_mode_t>();
+        startLive();
+
+        emit changed(control);
+    }
 }
 
 void IIDCImager::readTemperature()
@@ -390,6 +397,6 @@ void IIDCImagerWorker::setHighestFramerate(dc1394video_mode_t vidMode)
 
 void IIDCImager::startLive()
 {
-    restart([&] { return d->worker = std::make_shared<IIDCImagerWorker>(d->camera.get(), d->currentVidMode); });
+    restart([this] { return std::make_shared<IIDCImagerWorker>(d->camera.get(), d->currentVidMode); });
     qDebug() << "Video streaming started successfully";
 }
