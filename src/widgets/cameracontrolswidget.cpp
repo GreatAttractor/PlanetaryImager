@@ -100,8 +100,8 @@ CameraControl::CameraControl(const Imager::Control& control, Imager* imager, QWi
   auto_value_widget->setChecked(control.value_auto);
 
   on_off_value_widget = new QCheckBox("on");
-  on_off_value_widget->setVisible(control.supports_on_off);
-  on_off_value_widget->setChecked(control.value_on);
+  on_off_value_widget->setVisible(control.supports_onOff);
+  on_off_value_widget->setChecked(control.value_onOff);
   
   connect(control_widget, &ControlWidget::valueChanged, [=](const QVariant &v) {
     new_value.value = v;
@@ -110,7 +110,7 @@ CameraControl::CameraControl(const Imager::Control& control, Imager* imager, QWi
   connect(auto_value_widget, &QCheckBox::toggled, this, &CameraControl::auto_changed);
   connect(on_off_value_widget, &QCheckBox::toggled, this, &CameraControl::on_off_changed);
   
-  control_widget->setEnabled(!control.readonly && ! control.value_auto);
+  control_widget->setEnabled(!control.readonly && ! control.value_auto && !(control.supports_onOff && !control.value_onOff));
   connect(imager, &Imager::changed, this, &CameraControl::control_updated, Qt::QueuedConnection);
 }
 
@@ -126,7 +126,7 @@ void CameraControl::auto_changed(bool isAuto)
 
 void CameraControl::on_off_changed(bool isOn)
 {
-    new_value.value_on = isOn;
+    new_value.value_onOff = isOn;
     control_widget->setEnabled(isOn && !auto_value_widget->isChecked());
     auto_value_widget->setEnabled(isOn);
     on_off_value_widget->setChecked(isOn);

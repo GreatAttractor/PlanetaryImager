@@ -17,6 +17,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include "commons/utils.h"
 #include "iidc_deleters.h"
 #include "iidc_exception.h"
@@ -26,6 +27,7 @@
 #include "Qt/strings.h"
 #include <thread>
 
+using std::chrono::operator ""s;
 
 constexpr uint32_t NUM_DMA_BUFFERS = 4;
 
@@ -201,8 +203,6 @@ void IIDCImager::setControl(const Imager::Control& control)
     {
         d->currentVidMode = control.get_value_enum<dc1394video_mode_t>();
         startLive();
-
-        emit changed(control);
     }
     else
     {
@@ -220,20 +220,22 @@ void IIDCImager::setControl(const Imager::Control& control)
             }
         }
 
-        if (control.supports_on_off)
+        if (control.supports_onOff)
         {
             dc1394switch_t onOffState;
             IIDC_CHECK << dc1394_feature_get_power(d->camera.get(), (dc1394feature_t)control.id, &onOffState)
                        << "Get feature on/off state";
 
-            if ((DC1394_ON == onOffState) ^ control.value_on)
+            if ((DC1394_ON == onOffState) ^ control.value_onOff)
             {
-                IIDC_CHECK << dc1394_feature_set_power(d->camera.get(), (dc1394feature_t)control.id, control.value_on ? DC1394_ON
-                                                                                                                      : DC1394_OFF)
+                IIDC_CHECK << dc1394_feature_set_power(d->camera.get(), (dc1394feature_t)control.id, control.value_onOff ? DC1394_ON
+                                                                                                                         : DC1394_OFF)
                            << "Set feature on/off state";
             }
         }
     }
+
+    emit changed(control);
 }
 
 void IIDCImager::readTemperature()
@@ -274,6 +276,7 @@ Imager::Controls IIDCImager::controls() const
                     control.name = "Shutter";
                     control.is_exposure = true;
                     control.is_duration = true;
+                    control.duration_unit = 1s;
                     break;
 
                 case DC1394_FEATURE_GAIN:            control.name = "Gain"; break;
@@ -310,13 +313,13 @@ Imager::Controls IIDCImager::controls() const
             control.readonly = (0 == feature.modes.num &&
                                 DC1394_TRUE == feature.readout_capable);
 
-            control.supports_on_off = (DC1394_TRUE == feature.on_off_capable);
-            if (control.supports_on_off)
+            control.supports_onOff = (DC1394_TRUE == feature.on_off_capable);
+            if (control.supports_onOff)
             {
                 dc1394switch_t currOnOff;
                 IIDC_CHECK << dc1394_feature_get_power(d->camera.get(), feature.id, &currOnOff)
                            << "Get feature on/off";
-                control.value_on = (DC1394_ON == currOnOff);
+                control.value_onOff = (DC1394_ON == currOnOff);
             }
 
             dc1394feature_mode_t currMode;
@@ -324,11 +327,68 @@ Imager::Controls IIDCImager::controls() const
                         << "Get feature mode";
             control.value_auto = (DC1394_FEATURE_MODE_AUTO == currMode);
 
-            dc1394_feature_set_absolute_control(d->camera.get(), feature.id, DC1394_OFF);
+            uint32_t imin, imax;
+            IIDC_CHECK << dc1394_feature_get_boundaries(d->camera.get(), feature.id, &imin, &imax)
+                       << "Get feature boundaries";
+
+            // A feature is "absolute control-capable", if its value can be set using
+            // floating-point arguments, not just the integer "raw/driver" values.
+            // E.g. SHUTTER can be set in fractional "absolute" values expressed in seconds.
+            dc1394bool_t absoluteCapable;
+            IIDC_CHECK << dc1394_feature_has_absolute_control(d->camera.get(), feature.id, &absoluteCapable)
+                       << "Get feature absolute capability";
+
+            if (DC1394_TRUE == absoluteCapable)
+            {
+                control.decimals = 6;
+
+                IIDC_CHECK << dc1394_feature_set_absolute_control(d->camera.get(), feature.id, DC1394_ON)
+                           << "Set feature absolute control";
+
+                float fmin, fmax;
+                IIDC_CHECK << dc1394_feature_get_absolute_boundaries(d->camera.get(), feature.id, &fmin, &fmax)
+                           << "Get feature absolute boundaries";
+
+                if (DC1394_TRUE == feature.readout_capable)
+                {
+                    float fval;
+                    IIDC_CHECK << dc1394_feature_get_absolute_value(d->camera.get(), feature.id, &fval)
+                               << "Get feature absolute value";
+
+                    control.value = fval;
+                }
+                else
+                    control.value = fmin;
+
+                if (imax != imin)
+                    control.range.step = (fmax - fmin) / (imax - imin + 1);
+                else
+                    control.range.step = 0;
+
+                control.range.min = fmin;
+                control.range.max = fmax;
+            }
+            else
+            {
+                control.decimals = 0;
+
+                if (DC1394_TRUE == feature.readout_capable)
+                {
+                    uint32_t ival;
+                    IIDC_CHECK << dc1394_feature_get_value(d->camera.get(), feature.id, &ival)
+                               << "Get feature value";
+
+                    control.value = ival;
+                }
+                else
+                    control.value = imin;
+
+                control.range.min = imin;
+                control.range.min = imax;
+            }
 
             controls.push_back(std::move(control));
         }
-
 
     return controls;
 }
