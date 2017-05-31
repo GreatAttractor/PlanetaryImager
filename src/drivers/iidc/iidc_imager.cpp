@@ -204,6 +204,36 @@ void IIDCImager::setControl(const Imager::Control& control)
 
         emit changed(control);
     }
+    else
+    {
+        if (control.supports_auto)
+        {
+            dc1394feature_mode_t mode;
+            IIDC_CHECK << dc1394_feature_get_mode(d->camera.get(), (dc1394feature_t)control.id, &mode)
+                       << "Get feature mode";
+
+            if ((DC1394_FEATURE_MODE_AUTO == mode) ^ control.value_auto)
+            {
+                IIDC_CHECK << dc1394_feature_set_mode(d->camera.get(), (dc1394feature_t)control.id, control.value_auto ? DC1394_FEATURE_MODE_AUTO
+                                                                                                                       : DC1394_FEATURE_MODE_MANUAL)
+                           << "Set feature mode";
+            }
+        }
+
+        if (control.supports_on_off)
+        {
+            dc1394switch_t onOffState;
+            IIDC_CHECK << dc1394_feature_get_power(d->camera.get(), (dc1394feature_t)control.id, &onOffState)
+                       << "Get feature on/off state";
+
+            if ((DC1394_ON == onOffState) ^ control.value_on)
+            {
+                IIDC_CHECK << dc1394_feature_set_power(d->camera.get(), (dc1394feature_t)control.id, control.value_on ? DC1394_ON
+                                                                                                                      : DC1394_OFF)
+                           << "Set feature on/off state";
+            }
+        }
+    }
 }
 
 void IIDCImager::readTemperature()
@@ -227,7 +257,8 @@ Imager::Controls IIDCImager::controls() const
                 case DC1394_FEATURE_BRIGHTNESS:      control.name = "Brightness"; break;
 
                 // This is not "exposure time" (see DC1394_FEATURE_SHUTTER for that);
-                // instead, it regulates the values of shutter and gain - if they are set to auto
+                // instead, it regulates the desired overall image brightness by changing
+                // values of shutter and gain - if they are set to auto
                 case DC1394_FEATURE_EXPOSURE:        control.name = "Exposure"; break;
 
                 case DC1394_FEATURE_SHARPNESS:       control.name = "Sharpness"; break;
@@ -249,12 +280,15 @@ Imager::Controls IIDCImager::controls() const
                 case DC1394_FEATURE_IRIS:            control.name = "Iris"; break;
                 case DC1394_FEATURE_FOCUS:           control.name = "Focus"; break;
                 case DC1394_FEATURE_TEMPERATURE:     control.name = "Temperature"; break;
-                case DC1394_FEATURE_TRIGGER:         control.name = "Trigger"; break;
 
-                case DC1394_FEATURE_TRIGGER_DELAY:
-                    control.name = "Trigger delay";
-                    control.is_duration = true;
-                    break;
+                // TODO: requires special handling
+                // case DC1394_FEATURE_TRIGGER:         control.name = "Trigger"; break;
+
+                // TODO: uncomment when DC1394_FEATURE_TRIGGER is implemented
+                // case DC1394_FEATURE_TRIGGER_DELAY:
+                //     control.name = "Trigger delay";
+                //     control.is_duration = true;
+                //     break;
 
                 //TODO: this is in fact a triple of controls
                 //case DC1394_FEATURE_WHITE_SHADING:   control.name = "White shading"; break;
@@ -270,22 +304,27 @@ Imager::Controls IIDCImager::controls() const
                 default: continue;
             }
 
-            dc1394switch_t currOnOff;
-            IIDC_CHECK << dc1394_feature_get_power(d->camera.get(), feature.id, &currOnOff)
-                       << "Get feature on/off";
-            if (DC1394_OFF == currOnOff)
-                continue; // TODO: handle controls that are on/off-switchable
-
             control.supports_auto = (std::find(feature.modes.modes, feature.modes.modes + feature.modes.num, DC1394_FEATURE_MODE_AUTO)
                                        != feature.modes.modes + feature.modes.num);
 
             control.readonly = (0 == feature.modes.num &&
                                 DC1394_TRUE == feature.readout_capable);
 
+            control.supports_on_off = (DC1394_TRUE == feature.on_off_capable);
+            if (control.supports_on_off)
+            {
+                dc1394switch_t currOnOff;
+                IIDC_CHECK << dc1394_feature_get_power(d->camera.get(), feature.id, &currOnOff)
+                           << "Get feature on/off";
+                control.value_on = (DC1394_ON == currOnOff);
+            }
+
             dc1394feature_mode_t currMode;
             IIDC_CHECK << dc1394_feature_get_mode(d->camera.get(), feature.id, &currMode)
                         << "Get feature mode";
             control.value_auto = (DC1394_FEATURE_MODE_AUTO == currMode);
+
+            dc1394_feature_set_absolute_control(d->camera.get(), feature.id, DC1394_OFF);
 
             controls.push_back(std::move(control));
         }
