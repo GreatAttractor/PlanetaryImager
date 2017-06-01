@@ -116,8 +116,21 @@ Driver::Cameras IIDCDriver::cameras() const
     return cameras;
 }
 
+static void IIDCLogHandler(dc1394log_t type, const char *msg, void*)
+{
+    switch (type)
+    {
+    case DC1394_LOG_DEBUG:   qDebug()    << "(IIDC) " << msg; break;
+    case DC1394_LOG_WARNING: qWarning()  << "(IIDC) " << msg; break;
+    case DC1394_LOG_ERROR:   qCritical() << "(IIDC) " << msg; break;
+    }
+}
+
 IIDCDriver::IIDCDriver(): dptr()
 {
+    for (auto logType: { DC1394_LOG_ERROR, DC1394_LOG_WARNING, DC1394_LOG_DEBUG })
+        dc1394_log_register_handler(logType, IIDCLogHandler, nullptr);
+
     d->context.reset(dc1394_new());
     if (!d->context)
         qDebug() << "Could not initialize IIDC";

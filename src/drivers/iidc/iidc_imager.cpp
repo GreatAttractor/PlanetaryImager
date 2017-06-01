@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include "commons/utils.h"
+#include "drivers/roi.h"
 #include "iidc_deleters.h"
 #include "iidc_exception.h"
 #include "iidc_imager.h"
@@ -27,7 +28,7 @@
 #include "Qt/strings.h"
 #include <thread>
 
-using std::chrono::operator ""s;
+using namespace std::chrono;
 
 constexpr uint32_t NUM_DMA_BUFFERS = 4;
 
@@ -61,16 +62,36 @@ DPTR_IMPL(IIDCImager)
     dc1394video_mode_t currentVidMode;
 
     dc1394featureset_t features;
+    std::unordered_map<dc1394feature_t, bool> hasAbsoluteControl;
 
     Properties properties;
+
+    /// Copy of the SHUTTER control; used for informing GUI about shutter range change when framerate changes
+    Control ctrlShutter;
+
+    ROIValidator::ptr roiValidator; ///< Region of Interest validator
+
+    /// Concerns the current video mode; used to disable ROI and return to full image size
+    QSize maxFrameSize;
+
+    QRect currentROI;
 
     void updateWorkerExposureTimeout();
 
     Control enumerateVideoModes();
 
+    void getRawRange(dc1394feature_t id, uint32_t &rawMin, uint32_t &rawMax);
+
+    void getAbsoluteRange(dc1394feature_t id, float &absMin, float &absMax);
+
+    void changeVideoMode(dc1394video_mode_t newMode);
+
     LOG_C_SCOPE(IIDCImager);
-  //ROIValidator::ptr roi_validator;
 };
+
+static void UpdateRangeAndStep(bool absoluteCapable, Imager::Control &control,
+                               uint32_t rawMin, uint32_t rawMax,
+                               float    absMin, float    absMax);
 
 void IIDCImager::Private::updateWorkerExposureTimeout()
 {
@@ -100,13 +121,28 @@ Imager::Control IIDCImager::Private::enumerateVideoModes()
             vidMode <= DC1394_VIDEO_MODE_FORMAT7_MAX)
         {
             // Format7 modes may have additional capabilities:
+            //   - Frame size other than the fixed sizes in 'dc1394video_mode_t' enum
             //   - max framerate different than the predefined ones in 'dc1394framerate_t' enum
             //   - ROI support
             //   - various modes of pixel binning
             //
             // Some cameras may report only Format7 modes.
 
-            modeName += " (FMT7: %1)"_q % (vidMode - DC1394_VIDEO_MODE_FORMAT7_0);
+            dc1394format7mode_t fmt7mode;
+
+            IIDC_CHECK << dc1394_format7_get_mode_info(camera.get(), vidMode, &fmt7mode)
+                       << "Get Format7 mode info";
+
+            uint32_t f7width = fmt7mode.max_size_x;
+            if (0 == f7width)
+                f7width = width;
+
+            uint32_t f7height = fmt7mode.max_size_y;
+            if (0 == f7height)
+                f7height = height;
+
+            modeName = "%1x%2 %3 (FMT7: %4)"_q % f7width % f7height
+                                               % COLOR_CODING_NAME[coding] %  (vidMode - DC1394_VIDEO_MODE_FORMAT7_0);
         }
 
         videoMode.add_choice_enum(modeName, vidMode);
@@ -120,6 +156,7 @@ class IIDCImagerWorker: public ImagerThread::Worker
 {
     dc1394camera_t *camera;
     dc1394video_frame_t *nativeFrame; ///< The most recently captured frame
+    dc1394video_mode_t vidMode;
 
     struct
     {
@@ -145,17 +182,18 @@ class IIDCImagerWorker: public ImagerThread::Worker
 
     void initFrameInfo();
 
+    /// Does nothing if the current video mode is not scalable
+    void setROI(const QRect &roi);
+
     LOG_C_SCOPE(IIDCImagerWorker);
 
 public:
 
-    IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t vidMode);
-  
+    IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t _vidMode,
+                     /// Must be already validated; also used as the initial frame size for Format7 modes
+                     const QRect &roi);
+
     Frame::ptr shoot() override;
-
-    void setROI(const QRect &roi);
-
-    QRect ROI() const { return { }; }
 
     virtual ~IIDCImagerWorker();
 };
@@ -171,6 +209,7 @@ IIDCImager::IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera,
                << "Get supported video modes";
 
     d->currentVidMode = d->videoModes.modes[0];
+    d->changeVideoMode(d->currentVidMode);
 
     IIDC_CHECK << dc1394_feature_get_all(d->camera.get(), &d->features)
                << "Get all features";
@@ -187,12 +226,45 @@ Imager::Properties IIDCImager::properties() const
 {
     //TODO: obtain from the highest-resolution video mode;    d->properties.set_resolution_pixelsize()
 
-    return Imager::Properties() << LiveStream;
+    return Imager::Properties() << LiveStream << ROI;
 }
 
 QString IIDCImager::name() const
 {
     return "IIDC Imager";
+}
+
+void IIDCImager::Private::changeVideoMode(dc1394video_mode_t newMode)
+{
+    currentVidMode = newMode;
+
+    if (dc1394_is_video_mode_scalable(currentVidMode))
+    {
+        dc1394format7mode_t fmt7mode;
+
+        IIDC_CHECK << dc1394_format7_get_mode_info(camera.get(), currentVidMode, &fmt7mode)
+                   << "Get Format7 mode info";
+
+        roiValidator = std::make_shared<ROIValidator>(
+            std::list<ROIValidator::Rule>{ ROIValidator::x_multiple(fmt7mode.unit_pos_x),
+                                           ROIValidator::y_multiple(fmt7mode.unit_pos_y),
+                                           ROIValidator::width_multiple(fmt7mode.unit_size_x),
+                                           ROIValidator::height_multiple(fmt7mode.unit_size_y) });
+
+        maxFrameSize = { (int)fmt7mode.max_size_x, (int)fmt7mode.max_size_y };
+
+        currentROI = { 0, 0, maxFrameSize.width(), maxFrameSize.height() };
+    }
+    else
+    {
+        uint32_t width, height;
+        IIDC_CHECK << dc1394_get_image_size_from_video_mode(camera.get(), currentVidMode, &width, &height)
+                   << "Get image size from video mode";
+
+        currentROI = { 0, 0, (int)width, (int)height };
+
+        roiValidator = std::make_shared<ROIValidator>(std::list<ROIValidator::Rule>{ });
+    }
 }
 
 void IIDCImager::setControl(const Imager::Control& control)
@@ -201,7 +273,7 @@ void IIDCImager::setControl(const Imager::Control& control)
 
     if (control.id == ControlID::VideoMode)
     {
-        d->currentVidMode = control.get_value_enum<dc1394video_mode_t>();
+        d->changeVideoMode(control.get_value_enum<dc1394video_mode_t>());
         startLive();
     }
     else
@@ -233,13 +305,87 @@ void IIDCImager::setControl(const Imager::Control& control)
                            << "Set feature on/off state";
             }
         }
+
+        if ((!control.supports_onOff || control.value_onOff) &&
+            !(control.supports_auto  && control.value_auto))
+        {
+            if (d->hasAbsoluteControl[(dc1394feature_t)control.id])
+            {
+                IIDC_CHECK << dc1394_feature_set_absolute_value(d->camera.get(), (dc1394feature_t)control.id, control.value.toFloat())
+                           << "Set feature absolute value";
+            }
+            else
+            {
+                IIDC_CHECK << dc1394_feature_set_value(d->camera.get(), (dc1394feature_t)control.id, control.value.toInt())
+                           << "Set feature value";
+            }
+        }
     }
 
     emit changed(control);
+
+    if (DC1394_FEATURE_FRAME_RATE == control.id && d->ctrlShutter.valid())
+    {
+        // Changing framerate changes the shutter range; need to inform the GUI
+
+        uint32_t rawMin, rawMax;
+        float absMin, absMax;
+
+        d->getRawRange(DC1394_FEATURE_SHUTTER, rawMin, rawMax);
+
+        const bool hasAbsControl = d->hasAbsoluteControl[DC1394_FEATURE_SHUTTER];
+        if (hasAbsControl)
+            d->getAbsoluteRange(DC1394_FEATURE_SHUTTER, absMin, absMax);
+
+        UpdateRangeAndStep(hasAbsControl, d->ctrlShutter, rawMin, rawMax, absMin, absMax);
+
+        emit changed(d->ctrlShutter);
+    }
 }
 
 void IIDCImager::readTemperature()
 {
+}
+
+
+void IIDCImager::Private::getRawRange(dc1394feature_t id, uint32_t &rawMin, uint32_t &rawMax)
+{
+    IIDC_CHECK << dc1394_feature_get_boundaries(camera.get(), id, &rawMin, &rawMax)
+               << "Get feature boundaries";
+
+    if (rawMin > rawMax)
+        std::swap(rawMin, rawMax);
+}
+
+void IIDCImager::Private::getAbsoluteRange(dc1394feature_t id, float &absMin, float &absMax)
+{
+    IIDC_CHECK << dc1394_feature_get_absolute_boundaries(camera.get(), id, &absMin, &absMax)
+               << "Get feature absolute boundaries";
+
+    if (absMin > absMax)
+        std::swap(absMin, absMax);
+}
+
+static void UpdateRangeAndStep(bool absoluteCapable, Imager::Control &control,
+                               uint32_t rawMin, uint32_t rawMax,
+                               float    absMin, float    absMax)
+{
+    if (absoluteCapable)
+    {
+        if (rawMax != rawMin)
+            control.range.step = (absMax - absMin) / (rawMax - rawMin + 1);
+        else
+            control.range.step = 0;
+
+        control.range.min = absMin;
+        control.range.max = absMax;
+    }
+    else
+    {
+        control.range.min = rawMin;
+        control.range.max = rawMax;
+        control.range.step = (rawMin != rawMax ? 1 : 0);
+    }
 }
 
 Imager::Controls IIDCImager::controls() const
@@ -327,9 +473,10 @@ Imager::Controls IIDCImager::controls() const
                         << "Get feature mode";
             control.value_auto = (DC1394_FEATURE_MODE_AUTO == currMode);
 
-            uint32_t imin, imax;
-            IIDC_CHECK << dc1394_feature_get_boundaries(d->camera.get(), feature.id, &imin, &imax)
-                       << "Get feature boundaries";
+            float absMin, absMax;
+            uint32_t rawMin, rawMax;
+
+            d->getRawRange(feature.id, rawMin, rawMax);
 
             // A feature is "absolute control-capable", if its value can be set using
             // floating-point arguments, not just the integer "raw/driver" values.
@@ -340,14 +487,14 @@ Imager::Controls IIDCImager::controls() const
 
             if (DC1394_TRUE == absoluteCapable)
             {
+                d->hasAbsoluteControl[feature.id] = true;
+
                 control.decimals = 6;
 
                 IIDC_CHECK << dc1394_feature_set_absolute_control(d->camera.get(), feature.id, DC1394_ON)
                            << "Set feature absolute control";
 
-                float fmin, fmax;
-                IIDC_CHECK << dc1394_feature_get_absolute_boundaries(d->camera.get(), feature.id, &fmin, &fmax)
-                           << "Get feature absolute boundaries";
+                d->getAbsoluteRange(feature.id, absMin, absMax);
 
                 if (DC1394_TRUE == feature.readout_capable)
                 {
@@ -359,33 +506,29 @@ Imager::Controls IIDCImager::controls() const
                 }
                 else
                     control.value = fmin;
-
-                if (imax != imin)
-                    control.range.step = (fmax - fmin) / (imax - imin + 1);
-                else
-                    control.range.step = 0;
-
-                control.range.min = fmin;
-                control.range.max = fmax;
             }
             else
             {
+                d->hasAbsoluteControl[feature.id] = false;
+
                 control.decimals = 0;
 
                 if (DC1394_TRUE == feature.readout_capable)
                 {
-                    uint32_t ival;
-                    IIDC_CHECK << dc1394_feature_get_value(d->camera.get(), feature.id, &ival)
+                    uint32_t rawVal;
+                    IIDC_CHECK << dc1394_feature_get_value(d->camera.get(), feature.id, &rawVal)
                                << "Get feature value";
 
-                    control.value = ival;
+                    control.value = rawVal;
                 }
                 else
-                    control.value = imin;
-
-                control.range.min = imin;
-                control.range.min = imax;
+                    control.value = rawMin;
             }
+
+            UpdateRangeAndStep(d->hasAbsoluteControl[feature.id], control, rawMin, rawMax, absMin, absMax);
+
+            if (DC1394_FEATURE_SHUTTER == feature.id)
+                d->ctrlShutter = control; // See the comment for ctrlShutter
 
             controls.push_back(std::move(control));
         }
@@ -393,15 +536,20 @@ Imager::Controls IIDCImager::controls() const
     return controls;
 }
 
-IIDCImagerWorker::IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t vidMode)
-: camera(_camera), nativeFrame(nullptr)
+IIDCImagerWorker::IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t _vidMode,
+                                   const QRect &roi)
+: camera(_camera), nativeFrame(nullptr), vidMode(_vidMode)
 {
     frameInfo.initialized = false;
 
     IIDC_CHECK << dc1394_video_set_mode(camera, vidMode)
                << "Set video mode";
 
+    qDebug() << "Requested to set ROI to " << roi.x() << ", " << roi.y() << ", " << roi.width() << ", " << roi.height();
+
     setHighestFramerate(vidMode);
+
+    setROI(roi);
 
     IIDC_CHECK << dc1394_capture_setup(camera, NUM_DMA_BUFFERS, DC1394_CAPTURE_FLAGS_DEFAULT)
                << "Setup capture";
@@ -555,14 +703,13 @@ Frame::ptr IIDCImagerWorker::shoot()
 
 void IIDCImager::clearROI()
 {
+    setROI(QRect{ 0, 0, d->maxFrameSize.width(), d->maxFrameSize.height() });
 }
 
 void IIDCImager::setROI(const QRect &roi)
 {
-}
-
-void IIDCImagerWorker::setROI(const QRect& roi)
-{
+    d->currentROI = d->roiValidator->validate(roi, QRect{ });
+    startLive();
 }
 
 void IIDCImagerWorker::setHighestFramerate(dc1394video_mode_t vidMode)
@@ -582,6 +729,20 @@ void IIDCImagerWorker::setHighestFramerate(dc1394video_mode_t vidMode)
 
 void IIDCImager::startLive()
 {
-    restart([this] { return std::make_shared<IIDCImagerWorker>(d->camera.get(), d->currentVidMode); });
+    restart([this] { return std::make_shared<IIDCImagerWorker>(d->camera.get(), d->currentVidMode, d->currentROI); });
     qDebug() << "Video streaming started successfully";
+}
+
+void IIDCImagerWorker::setROI(const QRect &roi)
+{
+    if (dc1394_is_video_mode_scalable(vidMode))
+    {
+        dc1394color_coding_t colorcd;
+        IIDC_CHECK << dc1394_get_color_coding_from_video_mode(camera, vidMode, &colorcd)
+                   << "Get color coding from video mode";
+
+        IIDC_CHECK << dc1394_format7_set_roi(camera, vidMode, colorcd, DC1394_USE_MAX_AVAIL,
+                                             roi.x(), roi.y(), roi.width(), roi.height())
+                   << "Set ROI";
+    }
 }
