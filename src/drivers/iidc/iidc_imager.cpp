@@ -23,14 +23,14 @@
 #include "iidc_deleters.h"
 #include "iidc_exception.h"
 #include "iidc_imager.h"
+#include "iidc_worker.h"
 #include <map>
 #include <QRect>
 #include "Qt/strings.h"
 #include <thread>
 
-using namespace std::chrono;
 
-constexpr uint32_t NUM_DMA_BUFFERS = 4;
+using namespace std::chrono;
 
 enum ControlID: qlonglong
 {
@@ -52,10 +52,10 @@ static std::map<dc1394color_coding_t, const char *> COLOR_CODING_NAME
     { DC1394_COLOR_CODING_RAW16,   "RAW 16-bit"           },
 };
 
-class IIDCImagerWorker;
-
 DPTR_IMPL(IIDCImager)
 {
+    QString cameraName;
+
     std::unique_ptr<dc1394camera_t, Deleters::camera> camera;
 
     dc1394video_modes_t videoModes;
@@ -152,56 +152,11 @@ Imager::Control IIDCImager::Private::enumerateVideoModes()
     return videoMode;
 }
 
-class IIDCImagerWorker: public ImagerThread::Worker
-{
-    dc1394camera_t *camera;
-    dc1394video_frame_t *nativeFrame; ///< The most recently captured frame
-    dc1394video_mode_t vidMode;
-
-    struct
-    {
-        bool initialized; ///< If 'false', the remaining fields have not been set yet
-
-        Frame::ColorFormat colorFormat;
-        uint8_t bitsPerChannel;
-        Frame::ByteOrder byteOrder;
-        bool needsYUVtoRGBconversion;
-        size_t srcBytesPerLine; ///< Set only for YUV formats
-    } frameInfo;
-
-    /// Used for YUV->RGB conversion
-    /** Required, because conversion function expects buffers without line padding,
-        which may be present in a dequeued capture buffer. */
-    struct
-    {
-        std::unique_ptr<uint8_t[]> src, dest;
-    } conversionBuf;
-
-    /// If 'vidMode' supports a fixed set of framerates, sets the highest supported framerate
-    void setHighestFramerate(dc1394video_mode_t vidMode);
-
-    void initFrameInfo();
-
-    /// Does nothing if the current video mode is not scalable
-    void setROI(const QRect &roi);
-
-    LOG_C_SCOPE(IIDCImagerWorker);
-
-public:
-
-    IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t _vidMode,
-                     /// Must be already validated; also used as the initial frame size for Format7 modes
-                     const QRect &roi);
-
-    Frame::ptr shoot() override;
-
-    virtual ~IIDCImagerWorker();
-};
 
 //Q_DECLARE_METATYPE(IIDCImagerWorker::ImageType)
 
-IIDCImager::IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera, const ImageHandler::ptr &handler)
-: Imager(handler), dptr()
+IIDCImager::IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera, const ImageHandler::ptr &handler, const QString &cameraName)
+: Imager(handler), dptr(cameraName)
 {
     d->camera = std::move(camera);
 
@@ -226,12 +181,19 @@ Imager::Properties IIDCImager::properties() const
 {
     //TODO: obtain from the highest-resolution video mode;    d->properties.set_resolution_pixelsize()
 
-    return Imager::Properties() << LiveStream << ROI;
+    auto properties = Imager::Properties();
+    properties << LiveStream;
+
+    auto vmEnd = d->videoModes.modes + d->videoModes.num;
+    if (vmEnd != std::find_if(&d->videoModes.modes[0], vmEnd, [](const dc1394video_mode_t &vidMode) { return DC1394_TRUE == dc1394_is_video_mode_scalable(vidMode); }))
+        properties << ROI;
+
+    return properties;
 }
 
 QString IIDCImager::name() const
 {
-    return "IIDC Imager";
+    return d->cameraName;
 }
 
 void IIDCImager::Private::changeVideoMode(dc1394video_mode_t newMode)
@@ -536,170 +498,6 @@ Imager::Controls IIDCImager::controls() const
     return controls;
 }
 
-IIDCImagerWorker::IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t _vidMode,
-                                   const QRect &roi)
-: camera(_camera), nativeFrame(nullptr), vidMode(_vidMode)
-{
-    frameInfo.initialized = false;
-
-    IIDC_CHECK << dc1394_video_set_mode(camera, vidMode)
-               << "Set video mode";
-
-    qDebug() << "Requested to set ROI to " << roi.x() << ", " << roi.y() << ", " << roi.width() << ", " << roi.height();
-
-    setHighestFramerate(vidMode);
-
-    setROI(roi);
-
-    IIDC_CHECK << dc1394_capture_setup(camera, NUM_DMA_BUFFERS, DC1394_CAPTURE_FLAGS_DEFAULT)
-               << "Setup capture";
-
-    IIDC_CHECK << dc1394_video_set_transmission(camera, DC1394_ON)
-               << "Start video transmission";
-}
-
-IIDCImagerWorker::~IIDCImagerWorker()
-{
-    IIDC_CHECK << dc1394_video_set_transmission(camera, DC1394_OFF)
-               << "Stop video transmission";
-
-    IIDC_CHECK << dc1394_capture_stop(camera)
-               << "Stop capture";
-}
-
-void IIDCImagerWorker::initFrameInfo()
-{
-    switch (nativeFrame->color_coding)
-    {
-    case DC1394_COLOR_CODING_MONO8:
-    case DC1394_COLOR_CODING_MONO16:
-    case DC1394_COLOR_CODING_MONO16S:
-        frameInfo.colorFormat = Frame::ColorFormat::Mono; break;
-
-    // YUV formats will be converted to RGB before returning the frame
-    case DC1394_COLOR_CODING_YUV411:
-    case DC1394_COLOR_CODING_YUV422:
-    case DC1394_COLOR_CODING_YUV444:
-    case DC1394_COLOR_CODING_RGB8:
-    case DC1394_COLOR_CODING_RGB16:
-    case DC1394_COLOR_CODING_RGB16S:
-        frameInfo.colorFormat = Frame::ColorFormat::RGB; break;
-
-    case DC1394_COLOR_CODING_RAW8:
-    case DC1394_COLOR_CODING_RAW16:
-        switch (nativeFrame->color_filter)
-        {
-        case DC1394_COLOR_FILTER_RGGB: frameInfo.colorFormat = Frame::ColorFormat::Bayer_RGGB; break;
-        case DC1394_COLOR_FILTER_BGGR: frameInfo.colorFormat = Frame::ColorFormat::Bayer_BGGR; break;
-        case DC1394_COLOR_FILTER_GBRG: frameInfo.colorFormat = Frame::ColorFormat::Bayer_GBRG; break;
-        case DC1394_COLOR_FILTER_GRBG: frameInfo.colorFormat = Frame::ColorFormat::Bayer_GRBG; break;
-        }
-        break;
-    }
-
-    frameInfo.bitsPerChannel = nativeFrame->data_depth;
-    frameInfo.byteOrder = (nativeFrame->little_endian ? Frame::ByteOrder::LittleEndian : Frame::ByteOrder::BigEndian);
-
-    switch (nativeFrame->color_coding)
-    {
-    case DC1394_COLOR_CODING_YUV411: frameInfo.srcBytesPerLine = (3 * nativeFrame->size[0] + 1) / 2; break;
-    case DC1394_COLOR_CODING_YUV422: frameInfo.srcBytesPerLine = 2 * nativeFrame->size[0]; break;
-    case DC1394_COLOR_CODING_YUV444: frameInfo.srcBytesPerLine = 3 * nativeFrame->size[0]; break;
-
-    default: frameInfo.srcBytesPerLine = 0; break;
-    }
-}
-
-static bool isYUV(dc1394color_coding_t colorCoding)
-{
-    return colorCoding == DC1394_COLOR_CODING_YUV411 ||
-           colorCoding == DC1394_COLOR_CODING_YUV422 ||
-           colorCoding == DC1394_COLOR_CODING_YUV444;
-}
-
-Frame::ptr IIDCImagerWorker::shoot()
-{
-    //TODO: fail gracefully if cannot capture
-    IIDC_CHECK << dc1394_capture_dequeue(camera, DC1394_CAPTURE_POLICY_WAIT, &nativeFrame)
-               << "Capture dequeue";
-
-    if (!frameInfo.initialized)
-    {
-        initFrameInfo();
-        frameInfo.initialized = true;
-
-        if (isYUV(nativeFrame->color_coding))
-        {
-            frameInfo.needsYUVtoRGBconversion = true;
-            conversionBuf.src = std::make_unique<uint8_t[]>(nativeFrame->total_bytes); // Pass 'total_bytes' for simplicity; we may use less
-            conversionBuf.dest = std::make_unique<uint8_t[]>(nativeFrame->size[0] * nativeFrame->size[1] * 3); // 3 bytes/pixel (R, G, B)
-        }
-        else
-            frameInfo.needsYUVtoRGBconversion = false;
-    }
-
-    const size_t imgWidth = nativeFrame->size[0],
-                 imgHeight = nativeFrame->size[1];
-
-    auto frame = std::make_shared<Frame>(frameInfo.bitsPerChannel,
-                                         frameInfo.colorFormat,
-                                         QSize{ (int)imgWidth, (int)imgHeight },
-                                         frameInfo.byteOrder);
-
-    uint8_t *srcLine;
-    size_t srcLineStep;
-
-    uint8_t *destLine = frame->mat().data;
-    const size_t destLineStep = frame->mat().step[0];
-    size_t numDestCopyBytes; // Number of bytes per line to copy into 'frame'
-
-    if (frameInfo.needsYUVtoRGBconversion)
-    {
-        //
-        // 1) Condense source data from 'nativeFrame' into 'conversionBuf.src'
-        //
-
-        for (size_t y = 0; y < imgHeight; y++)
-            memcpy(conversionBuf.src.get() + y*frameInfo.srcBytesPerLine,
-                   nativeFrame->image + y * nativeFrame->stride,
-                   frameInfo.srcBytesPerLine);
-
-        //
-        // 2) Convert
-        //
-
-        dc1394_convert_to_RGB8(conversionBuf.src.get(), conversionBuf.dest.get(), imgWidth, imgHeight,
-                               nativeFrame->yuv_byte_order, nativeFrame->color_coding, 8);
-
-        //
-        // 3) Prepare to copy converted data to 'frame'
-        //
-
-        srcLine = conversionBuf.dest.get();
-        srcLineStep = imgWidth * 3;
-        numDestCopyBytes = std::min(destLineStep, imgWidth * 3);
-    }
-    else
-    {
-        srcLine = nativeFrame->image;
-        srcLineStep = nativeFrame->stride;
-        numDestCopyBytes = std::min(destLineStep, (size_t)nativeFrame->stride);
-    }
-
-    for (int y = 0; y < frame->mat().rows; y++)
-    {
-        memcpy(destLine, srcLine, numDestCopyBytes);
-
-        srcLine += srcLineStep;
-        destLine += destLineStep;
-    }
-
-    IIDC_CHECK << dc1394_capture_enqueue(camera, nativeFrame)
-               << "Capture enqueue";
-    nativeFrame = nullptr;
-
-    return frame;
-}
 
 void IIDCImager::clearROI()
 {
@@ -712,37 +510,9 @@ void IIDCImager::setROI(const QRect &roi)
     startLive();
 }
 
-void IIDCImagerWorker::setHighestFramerate(dc1394video_mode_t vidMode)
-{
-    if (!dc1394_is_video_mode_scalable(vidMode))
-    {
-        dc1394framerates_t framerates;
-        IIDC_CHECK << dc1394_video_get_supported_framerates(camera, vidMode, &framerates)
-                   << "Get supported framerates";
-
-        dc1394framerate_t *highest = std::max_element(framerates.framerates, framerates.framerates + framerates.num);
-
-        IIDC_CHECK << dc1394_video_set_framerate(camera, *highest)
-                   << "Set framerate";
-    }
-}
-
 void IIDCImager::startLive()
 {
     restart([this] { return std::make_shared<IIDCImagerWorker>(d->camera.get(), d->currentVidMode, d->currentROI); });
     qDebug() << "Video streaming started successfully";
 }
 
-void IIDCImagerWorker::setROI(const QRect &roi)
-{
-    if (dc1394_is_video_mode_scalable(vidMode))
-    {
-        dc1394color_coding_t colorcd;
-        IIDC_CHECK << dc1394_get_color_coding_from_video_mode(camera, vidMode, &colorcd)
-                   << "Get color coding from video mode";
-
-        IIDC_CHECK << dc1394_format7_set_roi(camera, vidMode, colorcd, DC1394_USE_MAX_AVAIL,
-                                             roi.x(), roi.y(), roi.width(), roi.height())
-                   << "Set ROI";
-    }
-}

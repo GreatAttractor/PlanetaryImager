@@ -70,7 +70,7 @@ Imager *IIDCCamera::imager(const ImageHandler::ptr &imageHandler) const
         throw IIDCException(0, msg);
     }
 
-    return new IIDCImager(std::move(cam), imageHandler);
+    return new IIDCImager(std::move(cam), imageHandler, m_Name);
 }
 
 Driver::Cameras IIDCDriver::cameras() const
