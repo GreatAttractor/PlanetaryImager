@@ -39,13 +39,14 @@ class IIDCCamera: public Driver::Camera
     dc1394camera_id_t camId;
 
     QString m_Name;
+    QString vendor;
 
 public:
 
     typedef std::shared_ptr<IIDCCamera> ptr;
 
-    IIDCCamera(dc1394_t *_context, const dc1394camera_id_t &id, const QString &name)
-        : context(_context), camId(id), m_Name(name) { }
+    IIDCCamera(dc1394_t *_context, const dc1394camera_id_t &id, const QString &name, const QString &_vendor)
+        : context(_context), camId(id), m_Name(name), vendor(_vendor) { }
 
     virtual ~IIDCCamera();
 
@@ -70,7 +71,7 @@ Imager *IIDCCamera::imager(const ImageHandler::ptr &imageHandler) const
         throw IIDCException(0, msg);
     }
 
-    return new IIDCImager(std::move(cam), imageHandler, m_Name);
+    return new IIDCImager(std::move(cam), imageHandler, m_Name, vendor);
 }
 
 Driver::Cameras IIDCDriver::cameras() const
@@ -104,11 +105,11 @@ Driver::Cameras IIDCDriver::cameras() const
         else
         {
             // Appending driver name, because FLIR/Point Grey cameras can be also detected & enumerated via FlyCapture2 driver
-            QString name = QString(cam->vendor) + " " + cam->model + " (IIDC)";
+            QString name = QString(cam->model) + " (IIDC)";
 
             cameras.push_back(std::make_shared<IIDCCamera>(d->context.get(),
                                                            d->cameraList->ids[i],
-                                                           name));
+                                                           name, cam->vendor));
             qDebug() << "IIDC camera index " << i << " is " << name;
         }
     }

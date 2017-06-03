@@ -55,6 +55,7 @@ static std::map<dc1394color_coding_t, const char *> COLOR_CODING_NAME
 DPTR_IMPL(IIDCImager)
 {
     QString cameraName;
+    QString cameraVendor;
 
     std::unique_ptr<dc1394camera_t, Deleters::camera> camera;
 
@@ -155,8 +156,9 @@ Imager::Control IIDCImager::Private::enumerateVideoModes()
 
 //Q_DECLARE_METATYPE(IIDCImagerWorker::ImageType)
 
-IIDCImager::IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera, const ImageHandler::ptr &handler, const QString &cameraName)
-: Imager(handler), dptr(cameraName)
+IIDCImager::IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera, const ImageHandler::ptr &handler,
+                       const QString &cameraName, const QString &cameraVendor)
+: Imager(handler), dptr(cameraName, cameraVendor)
 {
     d->camera = std::move(camera);
 
@@ -184,9 +186,33 @@ Imager::Properties IIDCImager::properties() const
     auto properties = Imager::Properties();
     properties << LiveStream;
 
+    properties << Imager::Properties::Property{ "Vendor", d->cameraVendor };
+
     auto vmEnd = d->videoModes.modes + d->videoModes.num;
     if (vmEnd != std::find_if(&d->videoModes.modes[0], vmEnd, [](const dc1394video_mode_t &vidMode) { return DC1394_TRUE == dc1394_is_video_mode_scalable(vidMode); }))
         properties << ROI;
+
+    QString iidcVersion;
+    switch (d->camera.get()->iidc_version)
+    {
+    case DC1394_IIDC_VERSION_1_04:   iidcVersion = "1.04"; break;
+    case DC1394_IIDC_VERSION_1_20:   iidcVersion = "1.20"; break;
+    case DC1394_IIDC_VERSION_PTGREY: iidcVersion = "Point Grey"; break;
+    case DC1394_IIDC_VERSION_1_30:   iidcVersion = "1.30"; break;
+    case DC1394_IIDC_VERSION_1_31:   iidcVersion = "1.31"; break;
+    case DC1394_IIDC_VERSION_1_32:   iidcVersion = "1.32"; break;
+    case DC1394_IIDC_VERSION_1_33:   iidcVersion = "1.33"; break;
+    case DC1394_IIDC_VERSION_1_34:   iidcVersion = "1.34"; break;
+    case DC1394_IIDC_VERSION_1_35:   iidcVersion = "1.35"; break;
+    case DC1394_IIDC_VERSION_1_36:   iidcVersion = "1.36"; break;
+    case DC1394_IIDC_VERSION_1_37:   iidcVersion = "1.37"; break;
+    case DC1394_IIDC_VERSION_1_38:   iidcVersion = "1.38"; break;
+    case DC1394_IIDC_VERSION_1_39:   iidcVersion = "1.39"; break;
+    }
+    properties << Imager::Properties::Property{ "IIDC version", iidcVersion };
+
+    properties << Imager::Properties::Property{ "Firmware version: ", QString::number(d->camera.get()->unit_sw_version, 10) + "." +
+                                                                      QString::number(d->camera.get()->unit_sub_sw_version, 10) };
 
     return properties;
 }

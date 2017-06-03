@@ -33,7 +33,8 @@ class IIDCImager: public Imager
 
 public:
 
-    IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera, const ImageHandler::ptr &handler, const QString &cameraName);
+    IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera, const ImageHandler::ptr &handler,
+               const QString &cameraName, const QString &cameraVendor);
 
     virtual ~IIDCImager();
 
