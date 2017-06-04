@@ -49,9 +49,6 @@ class IIDCImagerWorker: public ImagerThread::Worker
         std::unique_ptr<uint8_t[]> src, dest;
     } conversionBuf;
 
-    /// If 'vidMode' supports a fixed set of framerates, sets the highest supported framerate
-    void setHighestFramerate(dc1394video_mode_t vidMode);
-
     void initFrameInfo();
 
     /// Does nothing if the current video mode is not scalable
@@ -60,6 +57,8 @@ class IIDCImagerWorker: public ImagerThread::Worker
     LOG_C_SCOPE(IIDCImagerWorker);
 
 public:
+
+    static constexpr uint32_t NUM_DMA_BUFFERS = 4;
 
     IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t _vidMode,
                      /// Must be already validated; also used as the initial frame size for Format7 modes

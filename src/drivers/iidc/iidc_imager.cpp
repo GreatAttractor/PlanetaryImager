@@ -27,14 +27,18 @@
 #include <map>
 #include <QRect>
 #include "Qt/strings.h"
-#include <thread>
+#include <unordered_map>
 
 
 using namespace std::chrono;
 
 enum ControlID: qlonglong
 {
-    VideoMode = DC1394_FEATURE_MAX + 1
+    VideoMode = DC1394_FEATURE_MAX + 1,
+
+    // Used to select one of the fixed framerates from the 'dc1394framerate_t' enum (only for non-scalable = non-Format7 modes);
+    // a camera may also support DC1394_FEATURE_FRAME_RATE, which can change the frame rate independently and with finer granularity
+    FrameRate
 };
 
 static std::map<dc1394color_coding_t, const char *> COLOR_CODING_NAME
@@ -61,13 +65,15 @@ DPTR_IMPL(IIDCImager)
 
     dc1394video_modes_t videoModes;
     dc1394video_mode_t currentVidMode;
+    std::unordered_map<dc1394video_mode_t, dc1394framerates_t> frameRates; ///< Key: non-scalable video mode from 'videoModes'
+    std::unordered_map<dc1394video_mode_t, dc1394format7mode_t> fmt7Info; ///< Key: scalable video mode form 'videoModes'
 
     dc1394featureset_t features;
     std::unordered_map<dc1394feature_t, bool> hasAbsoluteControl;
 
     Properties properties;
 
-    /// Copy of the SHUTTER control; used for informing GUI about shutter range change when framerate changes
+    /// Copy of the SHUTTER control; used for informing GUI about shutter range change when frame rate changes
     Control ctrlShutter;
 
     ROIValidator::ptr roiValidator; ///< Region of Interest validator
@@ -86,6 +92,14 @@ DPTR_IMPL(IIDCImager)
     void getAbsoluteRange(dc1394feature_t id, float &absMin, float &absMax);
 
     void changeVideoMode(dc1394video_mode_t newMode);
+
+    /// If 'vidMode' supports a fixed set of frame rates, sets the highest supported frame rate
+    void setHighestFrameRate(dc1394video_mode_t vidMode);
+
+    Control getFrameRates(dc1394video_mode_t vidMode);
+
+    void updateShutterCtrl();
+
 
     LOG_C_SCOPE(IIDCImager);
 };
@@ -123,26 +137,15 @@ Imager::Control IIDCImager::Private::enumerateVideoModes()
         {
             // Format7 modes may have additional capabilities:
             //   - Frame size other than the fixed sizes in 'dc1394video_mode_t' enum
-            //   - max framerate different than the predefined ones in 'dc1394framerate_t' enum
+            //   - max frame rate different than the predefined ones in 'dc1394framerate_t' enum
             //   - ROI support
             //   - various modes of pixel binning
             //
             // Some cameras may report only Format7 modes.
 
-            dc1394format7mode_t fmt7mode;
+            const dc1394format7mode_t &fmt7 = fmt7Info[vidMode];
 
-            IIDC_CHECK << dc1394_format7_get_mode_info(camera.get(), vidMode, &fmt7mode)
-                       << "Get Format7 mode info";
-
-            uint32_t f7width = fmt7mode.max_size_x;
-            if (0 == f7width)
-                f7width = width;
-
-            uint32_t f7height = fmt7mode.max_size_y;
-            if (0 == f7height)
-                f7height = height;
-
-            modeName = "%1x%2 %3 (FMT7: %4)"_q % f7width % f7height
+            modeName = "%1x%2 %3 (FMT7: %4)"_q % fmt7.max_size_x % fmt7.max_size_y
                                                % COLOR_CODING_NAME[coding] %  (vidMode - DC1394_VIDEO_MODE_FORMAT7_0);
         }
 
@@ -153,6 +156,33 @@ Imager::Control IIDCImager::Private::enumerateVideoModes()
     return videoMode;
 }
 
+Imager::Control IIDCImager::Private::getFrameRates(dc1394video_mode_t vidMode)
+{
+    const auto frloc = frameRates.find(vidMode);
+    assert(frloc != frameRates.end());
+
+    const dc1394framerates_t &fr = frloc->second;
+
+    auto frameRatesCtrl = Imager::Control{ ControlID::FrameRate, "Fixed Frame Rate", Control::Combo };
+
+    for (auto i = 0; i < fr.num; i++)
+        switch (fr.framerates[i])
+        {
+        case DC1394_FRAMERATE_1_875: frameRatesCtrl.add_choice_enum("1.875 fps", fr.framerates[i]); break;
+        case DC1394_FRAMERATE_3_75:  frameRatesCtrl.add_choice_enum("3.75 fps",  fr.framerates[i]); break;
+        case DC1394_FRAMERATE_7_5:   frameRatesCtrl.add_choice_enum("7.5 fps",   fr.framerates[i]); break;
+        case DC1394_FRAMERATE_15:    frameRatesCtrl.add_choice_enum("15 fps",    fr.framerates[i]); break;
+        case DC1394_FRAMERATE_30:    frameRatesCtrl.add_choice_enum("30 fps",    fr.framerates[i]); break;
+        case DC1394_FRAMERATE_60:    frameRatesCtrl.add_choice_enum("60 fps",    fr.framerates[i]); break;
+        case DC1394_FRAMERATE_120:   frameRatesCtrl.add_choice_enum("120 fps",   fr.framerates[i]); break;
+        case DC1394_FRAMERATE_240:   frameRatesCtrl.add_choice_enum("240 fps",   fr.framerates[i]); break;
+        }
+
+    // Initially we set the highest frame rate, so report it as selected
+    frameRatesCtrl.set_value_enum(*std::max_element(fr.framerates, fr.framerates + fr.num));
+
+    return frameRatesCtrl;
+}
 
 //Q_DECLARE_METATYPE(IIDCImagerWorker::ImageType)
 
@@ -165,8 +195,30 @@ IIDCImager::IIDCImager(std::unique_ptr<dc1394camera_t, Deleters::camera> camera,
     IIDC_CHECK << dc1394_video_get_supported_modes(d->camera.get(), &d->videoModes)
                << "Get supported video modes";
 
+    for (auto i = 0; i < d->videoModes.num; i++)
+    {
+        const dc1394video_mode_t vidMode = d->videoModes.modes[i];
+
+        if (!dc1394_is_video_mode_scalable(vidMode))
+        {
+            auto modeFrameRates = d->frameRates.emplace(vidMode, dc1394framerates_t{ });
+            IIDC_CHECK << dc1394_video_get_supported_framerates(d->camera.get(), vidMode, &modeFrameRates.first->second)
+                       << "Get supported frame rates";
+        }
+        else
+        {
+            auto fmt7loc = d->fmt7Info.emplace(vidMode, dc1394format7mode_t{ });
+            dc1394format7mode_t &fmt7 = fmt7loc.first->second;
+            fmt7.present = DC1394_TRUE;
+
+            IIDC_CHECK << dc1394_format7_get_mode_info(d->camera.get(), vidMode, &fmt7)
+                       << "Get Format7 mode info";
+        }
+    }
+
     d->currentVidMode = d->videoModes.modes[0];
     d->changeVideoMode(d->currentVidMode);
+    d->setHighestFrameRate(d->currentVidMode);
 
     IIDC_CHECK << dc1394_feature_get_all(d->camera.get(), &d->features)
                << "Get all features";
@@ -224,35 +276,32 @@ QString IIDCImager::name() const
 
 void IIDCImager::Private::changeVideoMode(dc1394video_mode_t newMode)
 {
-    currentVidMode = newMode;
-
-    if (dc1394_is_video_mode_scalable(currentVidMode))
+    if (DC1394_TRUE == dc1394_is_video_mode_scalable(newMode))
     {
-        dc1394format7mode_t fmt7mode;
-
-        IIDC_CHECK << dc1394_format7_get_mode_info(camera.get(), currentVidMode, &fmt7mode)
-                   << "Get Format7 mode info";
+        const dc1394format7mode_t &fmt7 = fmt7Info[newMode];
 
         roiValidator = std::make_shared<ROIValidator>(
-            std::list<ROIValidator::Rule>{ ROIValidator::x_multiple(fmt7mode.unit_pos_x),
-                                           ROIValidator::y_multiple(fmt7mode.unit_pos_y),
-                                           ROIValidator::width_multiple(fmt7mode.unit_size_x),
-                                           ROIValidator::height_multiple(fmt7mode.unit_size_y) });
+            std::list<ROIValidator::Rule>{ ROIValidator::x_multiple(fmt7.unit_pos_x),
+                                           ROIValidator::y_multiple(fmt7.unit_pos_y),
+                                           ROIValidator::width_multiple(fmt7.unit_size_x),
+                                           ROIValidator::height_multiple(fmt7.unit_size_y) });
 
-        maxFrameSize = { (int)fmt7mode.max_size_x, (int)fmt7mode.max_size_y };
+        maxFrameSize = { (int)fmt7.max_size_x, (int)fmt7.max_size_y };
 
         currentROI = { 0, 0, maxFrameSize.width(), maxFrameSize.height() };
     }
     else
     {
         uint32_t width, height;
-        IIDC_CHECK << dc1394_get_image_size_from_video_mode(camera.get(), currentVidMode, &width, &height)
+        IIDC_CHECK << dc1394_get_image_size_from_video_mode(camera.get(), newMode, &width, &height)
                    << "Get image size from video mode";
 
         currentROI = { 0, 0, (int)width, (int)height };
 
         roiValidator = std::make_shared<ROIValidator>(std::list<ROIValidator::Rule>{ });
     }
+
+    currentVidMode = newMode;
 }
 
 void IIDCImager::setControl(const Imager::Control& control)
@@ -261,8 +310,38 @@ void IIDCImager::setControl(const Imager::Control& control)
 
     if (control.id == ControlID::VideoMode)
     {
-        d->changeVideoMode(control.get_value_enum<dc1394video_mode_t>());
+        const dc1394video_mode_t newMode = control.get_value_enum<dc1394video_mode_t>();
+
+        d->changeVideoMode(newMode);
+
         startLive();
+
+        if (dc1394_is_video_mode_scalable(newMode))
+        {
+            // Scalable modes do not use fixed frame rates; inform the GUI to show an empty list
+            Imager::Control emptyFrameRatesCtrl{ ControlID::FrameRate, "Fixed Frame Rate", Control::Combo };
+            emptyFrameRatesCtrl.add_choice("N/A", 0);
+            emptyFrameRatesCtrl.set_value(0);
+            emit changed(emptyFrameRatesCtrl);
+        }
+        else
+        {
+            d->setHighestFrameRate(newMode);
+            emit changed(d->getFrameRates(newMode));
+        }
+    }
+    else if (control.id == ControlID::FrameRate)
+    {
+        if (!dc1394_is_video_mode_scalable(d->currentVidMode))
+        {
+            IIDC_CHECK << dc1394_video_set_framerate(d->camera.get(), control.get_value_enum<dc1394framerate_t>())
+                       << "Set frame rate";
+
+            // Changing frame rate changes the shutter range; need to inform the GUI
+
+            d->updateShutterCtrl();
+            emit changed(d->ctrlShutter);
+        }
     }
     else
     {
@@ -314,19 +393,9 @@ void IIDCImager::setControl(const Imager::Control& control)
 
     if (DC1394_FEATURE_FRAME_RATE == control.id && d->ctrlShutter.valid())
     {
-        // Changing framerate changes the shutter range; need to inform the GUI
+        // Changing frame rate changes the shutter range; need to inform the GUI
 
-        uint32_t rawMin, rawMax;
-        float absMin, absMax;
-
-        d->getRawRange(DC1394_FEATURE_SHUTTER, rawMin, rawMax);
-
-        const bool hasAbsControl = d->hasAbsoluteControl[DC1394_FEATURE_SHUTTER];
-        if (hasAbsControl)
-            d->getAbsoluteRange(DC1394_FEATURE_SHUTTER, absMin, absMax);
-
-        UpdateRangeAndStep(hasAbsControl, d->ctrlShutter, rawMin, rawMax, absMin, absMax);
-
+        d->updateShutterCtrl();
         emit changed(d->ctrlShutter);
     }
 }
@@ -382,6 +451,9 @@ Imager::Controls IIDCImager::controls() const
 
     controls.push_back(std::move(d->enumerateVideoModes()));
 
+    if (DC1394_FALSE == dc1394_is_video_mode_scalable(d->currentVidMode))
+        controls.push_back(d->getFrameRates(d->currentVidMode));
+
     for (const dc1394feature_info_t &feature: d->features.feature)
         if (DC1394_TRUE == feature.available)
         {
@@ -430,13 +502,13 @@ Imager::Controls IIDCImager::controls() const
                 //TODO: this is in fact a triple of controls
                 //case DC1394_FEATURE_WHITE_SHADING:   control.name = "White shading"; break;
 
-                case DC1394_FEATURE_FRAME_RATE:      control.name = "Frame rate"; break;
+                case DC1394_FEATURE_FRAME_RATE:      control.name = "Frame Rate"; break;
                 case DC1394_FEATURE_ZOOM:            control.name = "Zoom"; break;
                 case DC1394_FEATURE_PAN:             control.name = "Pan"; break;
                 case DC1394_FEATURE_TILT:            control.name = "Tilt"; break;
-                case DC1394_FEATURE_OPTICAL_FILTER:  control.name = "Optical filter"; break;
-                case DC1394_FEATURE_CAPTURE_SIZE:    control.name = "Capture size"; break;
-                case DC1394_FEATURE_CAPTURE_QUALITY: control.name = "Capture quality"; break;
+                case DC1394_FEATURE_OPTICAL_FILTER:  control.name = "Optical Filter"; break;
+                case DC1394_FEATURE_CAPTURE_SIZE:    control.name = "Capture Size"; break;
+                case DC1394_FEATURE_CAPTURE_QUALITY: control.name = "Capture Quality"; break;
 
                 default: continue;
             }
@@ -542,3 +614,29 @@ void IIDCImager::startLive()
     qDebug() << "Video streaming started successfully";
 }
 
+void IIDCImager::Private::setHighestFrameRate(dc1394video_mode_t vidMode)
+{
+    if (!dc1394_is_video_mode_scalable(vidMode))
+    {
+        const dc1394framerates_t &f = frameRates[vidMode];
+
+        const dc1394framerate_t *highest = std::max_element(f.framerates, f.framerates + f.num);
+
+        IIDC_CHECK << dc1394_video_set_framerate(camera.get(), *highest)
+                   << "Set frame rate";
+    }
+}
+
+void IIDCImager::Private::updateShutterCtrl()
+{
+    uint32_t rawMin, rawMax;
+    float absMin, absMax;
+
+    getRawRange(DC1394_FEATURE_SHUTTER, rawMin, rawMax);
+
+    const bool hasAbsControl = hasAbsoluteControl[DC1394_FEATURE_SHUTTER];
+    if (hasAbsControl)
+        getAbsoluteRange(DC1394_FEATURE_SHUTTER, absMin, absMax);
+
+    UpdateRangeAndStep(hasAbsControl, ctrlShutter, rawMin, rawMax, absMin, absMax);
+}

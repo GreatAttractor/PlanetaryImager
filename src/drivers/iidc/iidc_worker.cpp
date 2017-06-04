@@ -21,8 +21,6 @@
 #include <QRect>
 
 
-constexpr uint32_t NUM_DMA_BUFFERS = 4;
-
 IIDCImagerWorker::IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t _vidMode,
                                    const QRect &roi)
 : camera(_camera), nativeFrame(nullptr), vidMode(_vidMode)
@@ -33,8 +31,7 @@ IIDCImagerWorker::IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t _
                << "Set video mode";
 
     qDebug() << "Requested to set ROI to " << roi.x() << ", " << roi.y() << ", " << roi.width() << ", " << roi.height();
-
-    setHighestFramerate(vidMode);
+    std::cout << "Requested to set ROI to " << roi.x() << ", " << roi.y() << ", " << roi.width() << ", " << roi.height() << std::endl; //TESTING #########
 
     setROI(roi);
 
@@ -186,21 +183,6 @@ Frame::ptr IIDCImagerWorker::shoot()
     nativeFrame = nullptr;
 
     return frame;
-}
-
-void IIDCImagerWorker::setHighestFramerate(dc1394video_mode_t vidMode)
-{
-    if (!dc1394_is_video_mode_scalable(vidMode))
-    {
-        dc1394framerates_t framerates;
-        IIDC_CHECK << dc1394_video_get_supported_framerates(camera, vidMode, &framerates)
-                   << "Get supported framerates";
-
-        dc1394framerate_t *highest = std::max_element(framerates.framerates, framerates.framerates + framerates.num);
-
-        IIDC_CHECK << dc1394_video_set_framerate(camera, *highest)
-                   << "Set framerate";
-    }
 }
 
 void IIDCImagerWorker::setROI(const QRect &roi)
