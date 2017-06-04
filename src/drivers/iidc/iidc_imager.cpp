@@ -338,9 +338,11 @@ void IIDCImager::setControl(const Imager::Control& control)
                        << "Set frame rate";
 
             // Changing frame rate changes the shutter range; need to inform the GUI
-
-            d->updateShutterCtrl();
-            emit changed(d->ctrlShutter);
+            if (d->ctrlShutter.valid())
+            {
+                d->updateShutterCtrl();
+                emit changed(d->ctrlShutter);
+            }
         }
     }
     else
