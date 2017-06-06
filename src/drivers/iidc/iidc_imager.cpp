@@ -294,7 +294,8 @@ void IIDCImager::Private::changeVideoMode(dc1394video_mode_t newMode)
             std::list<ROIValidator::Rule>{ ROIValidator::x_multiple(fmt7.unit_pos_x),
                                            ROIValidator::y_multiple(fmt7.unit_pos_y),
                                            ROIValidator::width_multiple(fmt7.unit_size_x),
-                                           ROIValidator::height_multiple(fmt7.unit_size_y) });
+                                           ROIValidator::height_multiple(fmt7.unit_size_y),
+                                           ROIValidator::within_rect(QRect{ 0, 0, (int)fmt7.max_size_x, (int)fmt7.max_size_y }) });
 
         maxFrameSize = { (int)fmt7.max_size_x, (int)fmt7.max_size_y };
 
@@ -494,6 +495,7 @@ Imager::Controls IIDCImager::controls() const
                     control.name = "Shutter";
                     control.is_exposure = true;
                     control.is_duration = true;
+                    // No way to check the unit using IIDC API, but PGR Firefly MV (FMVU-03MTM) and Chameleon3 (CM3-U3-13S2M) both use seconds
                     control.duration_unit = 1s;
                     break;
 
