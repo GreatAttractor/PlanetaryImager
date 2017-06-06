@@ -233,8 +233,6 @@ IIDCImager::~IIDCImager()
 
 Imager::Properties IIDCImager::properties() const
 {
-    //TODO: obtain from the highest-resolution video mode;    d->properties.set_resolution_pixelsize()
-
     auto properties = Imager::Properties();
     properties << LiveStream;
 
@@ -265,6 +263,18 @@ Imager::Properties IIDCImager::properties() const
 
     properties << Imager::Properties::Property{ "Firmware version: ", QString::number(d->camera.get()->unit_sw_version, 10) + "." +
                                                                       QString::number(d->camera.get()->unit_sub_sw_version, 10) };
+
+    const auto maxImageWidth = std::max_element(d->fmt7Info.begin(), d->fmt7Info.end(),
+                                          [](const auto &i1, const auto &i2)
+                                          { return i1.second.max_size_x < i2.second.max_size_x; });
+
+    const auto maxImageHeight = std::max_element(d->fmt7Info.begin(), d->fmt7Info.end(),
+                                          [](const auto &i1, const auto &i2)
+                                          { return i1.second.max_size_y < i2.second.max_size_y; });
+
+    properties.set_resolution({ (int)maxImageWidth->second.max_size_x,
+                                (int)maxImageHeight->second.max_size_y });
+
 
     return properties;
 }
