@@ -31,7 +31,6 @@ IIDCImagerWorker::IIDCImagerWorker(dc1394camera_t *_camera, dc1394video_mode_t _
                << "Set video mode";
 
     qDebug() << "Requested to set ROI to " << roi.x() << ", " << roi.y() << ", " << roi.width() << ", " << roi.height();
-    std::cout << "Requested to set ROI to " << roi.x() << ", " << roi.y() << ", " << roi.width() << ", " << roi.height() << std::endl; //TESTING #########
 
     setROI(roi);
 
